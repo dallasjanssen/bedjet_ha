@@ -186,7 +186,9 @@ class Nights:
         if role == "runtime":
             air = unit.air()
             minutes = unit.runtime_minutes
-            if air and air.mode != Mode.STANDBY and minutes is not None:
+            # Turning the BedJet off also drops its timer to 0, and Home Assistant may report that
+            # before the mode change. Only a timer still counting tells whether it was about to run out.
+            if air and air.mode != Mode.STANDBY and minutes:
                 self._runtime_seen[unit.id] = minutes
         elif role == "climate":
             self._watch_for_turn_off(unit, event.data.get("old_state"), event.data.get("new_state"))

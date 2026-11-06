@@ -100,6 +100,21 @@ async def test_turning_the_bedjet_off_elsewhere_ends_the_night(hass: HomeAssista
     assert ended[-1]["data"]["ending"] == "turned_off"
 
 
+async def test_turning_off_ends_the_night_whichever_update_arrives_first(hass: HomeAssistant, nights: Nights, fake):
+    await nights.start_night(UNIT, schedule_named(nights, "Hot Sleeper").id)
+    await settle(hass)
+    nights.units[UNIT].commanded_at = 0
+    # The timer reports 0 before the mode change does, as can happen when the BedJet is switched off.
+    fake.runtime = 0
+    fake.changed()
+    await settle(hass)
+    fake.set_mode("off")
+    await settle(hass)
+    assert UNIT not in nights.runs
+    off = [e for e in nights.store.history(UNIT, 0) if e["kind"] == "off"]
+    assert not off or off[-1]["data"]["timer_ran_out"] is False
+
+
 async def test_the_bedjets_own_timer_running_out_does_not_end_the_night(hass: HomeAssistant, nights: Nights, fake):
     await nights.start_night(UNIT, schedule_named(nights, "Hot Sleeper").id)
     await settle(hass)
