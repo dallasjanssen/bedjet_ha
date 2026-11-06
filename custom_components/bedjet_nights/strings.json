@@ -1,0 +1,32 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "BedJet Nights",
+        "description": "Adds night schedules, a remote and night history for the BedJets already in Home Assistant. A BedJet Nights panel appears in the sidebar."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "BedJet Nights is already set up."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "night_running": { "name": "Night running" }
+    },
+    "button": {
+      "end_night": { "name": "End night" },
+      "start_night": { "name": "Start night" }
+    },
+    "select": {
+      "tonight": { "name": "Tonight's schedule" }
+    },
+    "sensor": {
+      "night": { "name": "Night" },
+      "night_ends": { "name": "Night ends" }
+    },
+    "switch": {
+      "start_at_bedtime": { "name": "Start at bedtime" }
+    }
+  }
+}

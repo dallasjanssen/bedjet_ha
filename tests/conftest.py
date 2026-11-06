@@ -1,73 +1,56 @@
-"""Shared test fixtures: a pretend Home Assistant and BedJet Nights connected to it."""
+"""Fixtures: Home Assistant with a simulated BedJet (dev/fake_bedjet) and BedJet Nights set up."""
 
 from __future__ import annotations
 
-import asyncio
+import pytest
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-import aiohttp
-import pytest_asyncio
-from aiohttp import web
+from homeassistant.core import HomeAssistant
+from homeassistant.util.unit_system import US_CUSTOMARY_SYSTEM
 
-from bedjet_nights import nights as nights_module
-from bedjet_nights.config import Config
-from bedjet_nights.ha import HomeAssistant
-from bedjet_nights.nights import Nights
-from bedjet_nights.store import Store
-from bedjet_nights.web import build_app
+from custom_components.bedjet_nights import nights as nights_module
+from custom_components.bedjet_nights.nights import Nights
 
-from fake_ha import FakeHomeAssistant
+CLIMATE = "climate.dallass_bedjet"
 
 
-class Harness:
-    def __init__(self, fake: FakeHomeAssistant, nights: Nights, ha: HomeAssistant, client: aiohttp.ClientSession, base: str):
-        self.fake = fake
-        self.nights = nights
-        self.ha = ha
-        self.client = client
-        self.base = base
-
-    def services(self) -> list[str]:
-        return [call["service"] for call in self.fake.calls if "service" in call]
-
-    async def settle(self, seconds: float = 0.2) -> None:
-        await asyncio.sleep(seconds)
+@pytest.fixture(autouse=True)
+def auto_enable_custom_integrations(enable_custom_integrations):
+    yield
 
 
-@pytest_asyncio.fixture
-async def harness(tmp_path, monkeypatch):
+@pytest.fixture(autouse=True)
+def quick_history(monkeypatch):
     monkeypatch.setattr(nights_module, "RECORD_SETTLE", 0.05)
-    fake = FakeHomeAssistant()
-    runner = web.AppRunner(fake.app)
-    await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 0)
-    await site.start()
-    port = site._server.sockets[0].getsockname()[1]
 
-    config = Config(ha_url=f"http://127.0.0.1:{port}", ha_token="test-token", data_dir=str(tmp_path))
-    store = Store(str(tmp_path / "test.db"))
-    session = aiohttp.ClientSession()
-    ha = HomeAssistant(config.ha_url, config.ha_token, session)
-    nights = Nights(config, store, ha)
-    ha.start()
-    for _ in range(100):
-        if ha.connected and nights.units:
-            break
-        await asyncio.sleep(0.05)
-    assert nights.units, "the BedJet was not found"
 
-    app_runner = web.AppRunner(build_app(nights))
-    await app_runner.setup()
-    app_site = web.TCPSite(app_runner, "127.0.0.1", 0)
-    await app_site.start()
-    app_port = app_site._server.sockets[0].getsockname()[1]
-    client = aiohttp.ClientSession()
+@pytest.fixture
+async def bedjet_entry(hass: HomeAssistant) -> MockConfigEntry:
+    """The simulated BedJet, shown in Fahrenheit like the real one in this house."""
+    hass.config.units = US_CUSTOMARY_SYSTEM
+    await hass.config.async_set_time_zone("America/Chicago")
+    entry = MockConfigEntry(domain="bedjet", title="Dallas’s Bedjet")
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert hass.states.get(CLIMATE) is not None, sorted(hass.states.async_entity_ids())
+    return entry
 
-    yield Harness(fake, nights, ha, client, f"http://127.0.0.1:{app_port}")
 
-    await client.close()
-    await app_runner.cleanup()
-    await nights.stop()
-    await ha.stop()
-    await session.close()
-    await runner.cleanup()
-    store.close()
+@pytest.fixture
+def fake(bedjet_entry: MockConfigEntry):
+    return bedjet_entry.runtime_data
+
+
+@pytest.fixture
+async def nights_entry(hass: HomeAssistant, bedjet_entry: MockConfigEntry) -> MockConfigEntry:
+    entry = MockConfigEntry(domain="bedjet_nights", title="BedJet Nights")
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    return entry
+
+
+@pytest.fixture
+def nights(nights_entry: MockConfigEntry) -> Nights:
+    return nights_entry.runtime_data

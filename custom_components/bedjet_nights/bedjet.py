@@ -13,12 +13,20 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .ha import HomeAssistant, HomeAssistantError
+from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN, UnitOfTemperature
+from homeassistant.core import HomeAssistant, State
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+
+from .const import BEDJET_DOMAIN
 from .model import Mode
 
 _LOGGER = logging.getLogger(__name__)
 
-UNAVAILABLE = ("unavailable", "unknown")
+UNAVAILABLE = (STATE_UNAVAILABLE, STATE_UNKNOWN)
+USABLE = (None, er.RegistryEntryDisabler.CONFIG_ENTRY)
+"""Registry entries that are on, or off only while their integration is paused (lent to a phone)."""
 
 
 @dataclass(frozen=True)
@@ -49,19 +57,21 @@ def from_half_celsius(half: int, fahrenheit: bool) -> float:
     return round(celsius * 9 / 5 + 32, 1) if fahrenheit else celsius
 
 
-def _matches(entry: dict[str, Any], key: str) -> bool:
-    return entry.get("translation_key") == key or str(entry.get("unique_id", "")).endswith(f"_{key}")
+def _matches(entry: er.RegistryEntry, key: str) -> bool:
+    return entry.translation_key == key or str(entry.unique_id).endswith(f"_{key}")
 
 
 class BedJetUnit:
     """A BedJet found in Home Assistant, addressed by its climate entity."""
 
-    def __init__(self, ha: HomeAssistant, climate: dict[str, Any]) -> None:
-        self.ha = ha
-        self.id: str = climate["entity_id"]
+    def __init__(self, hass: HomeAssistant, entry: er.RegistryEntry) -> None:
+        self.hass = hass
+        self.id: str = entry.entity_id
+        self.registry_id: str = entry.id
+        """Stable even if the climate entity is renamed, so it names our entities' unique IDs."""
         self.slug = self.id.split(".", 1)[1]
-        self.registry = climate
-        self.device: dict[str, Any] = {}
+        self.registry: er.RegistryEntry = entry
+        self.device: dr.DeviceEntry | None = None
         self.runtime_entity: str | None = None
         self.ambient_entity: str | None = None
         self.led_entity: str | None = None
@@ -74,66 +84,71 @@ class BedJetUnit:
     # Discovery
 
     def refresh_links(self) -> None:
-        for entry in self.ha.entities:
-            if entry.get("entity_id") == self.id:
-                self.registry = entry
-        device_id = self.registry.get("device_id")
-        self.device = self.ha.devices.get(device_id, {}) if device_id else {}
-        siblings = [
-            entry for entry in self.ha.entities
-            if device_id and entry.get("device_id") == device_id and entry.get("entity_id") != self.id
-        ]
+        entities = er.async_get(self.hass)
+        entry = entities.async_get(self.registry_id) or entities.async_get(self.id)
+        if entry is not None:
+            self.registry = entry
+            self.id = entry.entity_id
+            self.slug = self.id.split(".", 1)[1]
+        device_id = self.registry.device_id
+        self.device = dr.async_get(self.hass).async_get(device_id) if device_id else None
+        siblings = (
+            [
+                e for e in er.async_entries_for_device(entities, device_id, include_disabled_entities=True)
+                if e.entity_id != self.id and e.disabled_by in USABLE
+            ]
+            if device_id
+            else []
+        )
         self.runtime_entity = self._find(siblings, "number", "runtime_remaining")
         self.ambient_entity = self._find(siblings, "sensor", "ambient_temperature")
         self.led_entity = self._find(siblings, "switch", "enable_led")
         self.mute_entity = self._find(siblings, "switch", "mute_beeps")
 
     @staticmethod
-    def _find(siblings: list[dict[str, Any]], domain: str, key: str) -> str | None:
+    def _find(siblings: list[er.RegistryEntry], domain: str, key: str) -> str | None:
         for entry in siblings:
-            entity_id = entry.get("entity_id", "")
-            if entity_id.startswith(f"{domain}.") and _matches(entry, key) and not entry.get("disabled_by"):
-                return entity_id
+            if entry.domain == domain and _matches(entry, key):
+                return entry.entity_id
         return None
 
     @property
     def config_entry_id(self) -> str | None:
-        return self.registry.get("config_entry_id")
-
-    @property
-    def bluetooth_connections(self) -> list[list[str]]:
-        return [list(pair) for pair in self.device.get("connections") or []]
+        return self.registry.config_entry_id
 
     @property
     def name(self) -> str:
         state = self.state
         return (
-            self.device.get("name_by_user")
-            or (state or {}).get("attributes", {}).get("friendly_name")
-            or self.device.get("name")
+            (self.device.name_by_user if self.device else None)
+            or (state.attributes.get("friendly_name") if state else None)
+            or (self.device.name if self.device else None)
             or self.slug.replace("_", " ").title()
         )
 
     @property
     def model(self) -> str:
-        return self.device.get("model") or "BedJet"
+        return (self.device.model if self.device else None) or "BedJet"
 
     @property
-    def state(self) -> dict[str, Any] | None:
-        return self.ha.states.get(self.id)
+    def state(self) -> State | None:
+        return self.hass.states.get(self.id)
 
     @property
     def available(self) -> bool:
         state = self.state
-        return bool(self.ha.connected and state and state.get("state") not in UNAVAILABLE)
+        return bool(state and state.state not in UNAVAILABLE)
+
+    @property
+    def fahrenheit(self) -> bool:
+        return self.hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT
 
     @property
     def generation(self) -> str:
         """The V2 has no Dry, which is the easiest thing to read from Home Assistant."""
-        model = self.model.upper()
-        if "V2" in model:
+        if "V2" in self.model.upper():
             return "v2"
-        modes = ((self.state or {}).get("attributes") or {}).get("hvac_modes") or []
+        modes = self._attributes().get("hvac_modes") or []
         if modes and "dry" not in modes:
             return "v2"
         return "v3"
@@ -141,7 +156,8 @@ class BedJetUnit:
     # Reading
 
     def _attributes(self) -> dict[str, Any]:
-        return (self.state or {}).get("attributes") or {}
+        state = self.state
+        return dict(state.attributes) if state else {}
 
     def _preset_named(self, *fragments: str) -> str | None:
         for preset in self._attributes().get("preset_modes") or []:
@@ -158,10 +174,10 @@ class BedJetUnit:
 
     def air(self) -> Air | None:
         state = self.state
-        if not state or state.get("state") in UNAVAILABLE:
+        if not state or state.state in UNAVAILABLE:
             return None
-        hvac = state.get("state")
-        attributes = state.get("attributes") or {}
+        hvac = state.state
+        attributes = state.attributes
         preset = (attributes.get("preset_mode") or "").lower()
         if hvac == "off":
             mode = Mode.STANDBY
@@ -180,16 +196,16 @@ class BedJetUnit:
         fan = str(attributes.get("fan_mode") or "").rstrip("%")
         return Air(
             mode,
-            to_half_celsius(float(target), self.ha.fahrenheit) if target is not None else None,
+            to_half_celsius(float(target), self.fahrenheit) if target is not None else None,
             int(fan) if fan.isdigit() else None,
         )
 
     def _number(self, entity_id: str | None) -> float | None:
-        state = self.ha.states.get(entity_id) if entity_id else None
-        if not state or state.get("state") in UNAVAILABLE:
+        state = self.hass.states.get(entity_id) if entity_id else None
+        if not state or state.state in UNAVAILABLE:
             return None
         try:
-            return float(state["state"])
+            return float(state.state)
         except (TypeError, ValueError):
             return None
 
@@ -200,33 +216,33 @@ class BedJetUnit:
 
     @property
     def runtime_max(self) -> int | None:
-        state = self.ha.states.get(self.runtime_entity) if self.runtime_entity else None
+        state = self.hass.states.get(self.runtime_entity) if self.runtime_entity else None
         if not state:
             return None
         try:
-            return int(float(state.get("attributes", {}).get("max", 0)))
+            return int(float(state.attributes.get("max", 0)))
         except (TypeError, ValueError):
             return None
 
     @property
     def room_celsius(self) -> float | None:
-        state = self.ha.states.get(self.ambient_entity) if self.ambient_entity else None
-        if not state or state.get("state") in UNAVAILABLE:
+        state = self.hass.states.get(self.ambient_entity) if self.ambient_entity else None
+        if not state or state.state in UNAVAILABLE:
             return None
-        unit = (state.get("attributes") or {}).get("unit_of_measurement", "")
-        return to_celsius(state.get("state"), "F" in unit)
+        unit = state.attributes.get("unit_of_measurement", "")
+        return to_celsius(state.state, "F" in str(unit))
 
     def _switch(self, entity_id: str | None) -> bool | None:
-        state = self.ha.states.get(entity_id) if entity_id else None
-        if not state or state.get("state") in UNAVAILABLE:
+        state = self.hass.states.get(entity_id) if entity_id else None
+        if not state or state.state in UNAVAILABLE:
             return None
-        return state.get("state") == "on"
+        return state.state == "on"
 
     def status(self) -> dict[str, Any]:
-        """What the web UI shows, with temperatures in Celsius."""
+        """What the panel shows, with temperatures in Celsius."""
         air = self.air()
         attributes = self._attributes()
-        fahrenheit = self.ha.fahrenheit
+        fahrenheit = self.fahrenheit
         return {
             "available": self.available,
             "mode": air.mode.value if air else None,
@@ -246,9 +262,12 @@ class BedJetUnit:
     # Commands
 
     async def _service(self, domain: str, service: str, entity_id: str, **data: Any) -> None:
+        _LOGGER.debug("%s.%s %s %s", domain, service, entity_id, data)
         self.commanded_at = time.time()
-        await self.ha.call_service(domain, service, entity_id, **data)
-        self.commanded_at = time.time()
+        try:
+            await self.hass.services.async_call(domain, service, {"entity_id": entity_id, **data}, blocking=True)
+        finally:
+            self.commanded_at = time.time()
 
     async def _wait_for_mode(self, mode: Mode, timeout: float = 8) -> None:
         deadline = time.monotonic() + timeout
@@ -283,11 +302,13 @@ class BedJetUnit:
 
     async def _set_temperature(self, half_celsius: int) -> None:
         attributes = self._attributes()
-        value = from_half_celsius(half_celsius, self.ha.fahrenheit)
-        # Home Assistant rejects targets outside what the BedJet reports for the mode it is in.
+        value = from_half_celsius(half_celsius, self.fahrenheit)
+        # Home Assistant rejects targets outside what the BedJet reports for the mode it is in. The
+        # limits it shows are rounded (to whole degrees in Fahrenheit), so stay that much inside them.
         low, high = attributes.get("min_temp"), attributes.get("max_temp")
-        if low is not None and high is not None and float(low) <= float(high):
-            value = min(max(value, float(low)), float(high))
+        if low is not None and high is not None and float(low) < float(high):
+            margin = 0.5 if self.fahrenheit else 0.05
+            value = min(max(value, float(low) + margin), float(high) - margin)
         await self._service("climate", "set_temperature", self.id, temperature=value)
 
     async def set_fan(self, percent: int) -> None:
@@ -352,17 +373,13 @@ class BedJetUnit:
             await self._service("switch", "turn_on" if on else "turn_off", entity_id)
 
 
-def find_bedjets(ha: HomeAssistant, wanted: list[str]) -> list[dict[str, Any]]:
-    """Climate entities from a BedJet integration, or exactly the ones named in BEDJET_ENTITIES.
+def find_bedjets(hass: HomeAssistant) -> list[er.RegistryEntry]:
+    """Climate entities from the BedJet integration.
 
-    An entity of an integration that is lent to a phone is disabled by its config entry for a
-    while, and is still listed so its schedules and history stay in view.
+    An entity whose integration is lent to a phone is disabled by its config entry for a while,
+    and is still listed so its schedules and history stay in view.
     """
-    entries = [entry for entry in ha.entities if str(entry.get("entity_id", "")).startswith("climate.")]
-    if wanted:
-        by_id = {entry["entity_id"]: entry for entry in entries}
-        return [by_id.get(entity_id, {"entity_id": entity_id}) for entity_id in wanted]
     return [
-        entry for entry in entries
-        if entry.get("platform") == "bedjet" and entry.get("disabled_by") in (None, "config_entry")
+        entry for entry in er.async_get(hass).entities.values()
+        if entry.domain == "climate" and entry.platform == BEDJET_DOMAIN and entry.disabled_by in USABLE
     ]

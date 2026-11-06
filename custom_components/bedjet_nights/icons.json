@@ -1,0 +1,18 @@
+{
+  "entity": {
+    "button": {
+      "end_night": { "default": "mdi:stop" },
+      "start_night": { "default": "mdi:play" }
+    },
+    "select": {
+      "tonight": { "default": "mdi:weather-night" }
+    },
+    "sensor": {
+      "night": { "default": "mdi:sleep" },
+      "night_ends": { "default": "mdi:weather-sunset-up" }
+    },
+    "switch": {
+      "start_at_bedtime": { "default": "mdi:bed-clock" }
+    }
+  }
+}

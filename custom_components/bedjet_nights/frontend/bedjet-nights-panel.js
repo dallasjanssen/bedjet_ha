@@ -1,9 +1,10 @@
-"use strict";
-
-/* BedJet Nights web UI. Plain JavaScript, no build step.
+/* BedJet Nights sidebar panel for Home Assistant. Plain JavaScript, no build step.
    Schedules, the night curve and history follow Lull (github.com/rkanjani/lull, MIT). */
 
-(() => {
+const VERSION = new URL(import.meta.url).search;
+const STYLESHEET = new URL("app.css", import.meta.url).href.split("?")[0] + VERSION;
+
+function createApp(root, host) {
   const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
   const saved = {
@@ -21,7 +22,6 @@
   const S = {
     snap: null,
     offset: 0,
-    offline: false,
     tab: saved.get("tab", "schedule"),
     unitId: saved.get("unit", null),
     busy: null,
@@ -169,6 +169,7 @@
     stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
     phone: '<rect x="6.5" y="2.5" width="11" height="19" rx="2"/><path d="M11 18.5h2"/>',
     template: '<rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8 14c1.5 0 2-4 4-4s2.5 4 4 4"/>',
+    menu: '<path d="M4 7h16M4 12h16M4 17h16"/>',
   };
   const icon = (name) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ""}</svg>`;
 
@@ -278,15 +279,13 @@
 
   // Talking to the server
 
-  async function api(method, path, body) {
-    const response = await fetch(path, {
-      method,
-      headers: body ? { "Content-Type": "application/json" } : {},
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    let data = {};
-    try { data = await response.json(); } catch { /* empty reply */ }
-    if (!response.ok) throw new Error(data.error || `Something went wrong (${response.status}).`);
+  async function ws(command, payload = {}) {
+    let data;
+    try {
+      data = await host.hass.callWS({ type: `bedjet_nights/${command}`, ...payload });
+    } catch (err) {
+      throw new Error((err && err.message) || "Something went wrong.");
+    }
     if (data && Array.isArray(data.units)) setSnap(data);
     return data;
   }
@@ -300,12 +299,12 @@
 
   function toast(message) {
     clearTimeout(S.toastTimer);
-    let el = document.querySelector(".toast");
+    let el = root.querySelector(".toast");
     if (!el) {
       el = document.createElement("div");
       el.className = "toast";
       el.setAttribute("role", "alert");
-      document.body.appendChild(el);
+      root.querySelector(".frame").appendChild(el);
     }
     el.textContent = message;
     S.toastTimer = setTimeout(() => el.remove(), 5000);
@@ -314,37 +313,39 @@
   function setSnap(snap) {
     S.snap = snap;
     S.offset = snap.now - Date.now() / 1000;
-    S.offline = false;
     const ids = snap.units.map((u) => u.id);
     if (!ids.includes(S.unitId)) S.unitId = ids[0] || null;
     render();
   }
 
+  // Live updates: Home Assistant sends the whole state again whenever something changes.
+  let unsubscribe = null;
   function connect() {
-    if (!window.EventSource) {
-      setInterval(() => api("GET", "api/state").catch(() => {}), 5000);
-      return;
-    }
-    const source = new EventSource("api/events");
-    source.addEventListener("state", (event) => setSnap(JSON.parse(event.data)));
-    source.onerror = () => {
-      S.offline = true;
-      render();
-    };
+    if (unsubscribe || !host.hass) return;
+    unsubscribe = host.hass.connection
+      .subscribeMessage((snap) => setSnap(snap), { type: "bedjet_nights/subscribe" })
+      .catch((err) => {
+        unsubscribe = null;
+        toast((err && err.message) || "BedJet Nights isn't running. Check its integration in Settings.");
+      });
+  }
+  function disconnect() {
+    if (!unsubscribe) return;
+    unsubscribe.then((stop) => stop && stop()).catch(() => {});
+    unsubscribe = null;
   }
 
   const unit = () => (S.snap ? S.snap.units.find((u) => u.id === S.unitId) : null);
   const schedules = () => (S.snap ? S.snap.schedules : []);
   const scheduleById = (id) => schedules().find((s) => s.id === id);
-  const unitPath = (u, action) => `api/units/${encodeURIComponent(u.id)}/${action}`;
 
   // Rendering
 
   function render() {
     if (S.dragging) { S.pendingRender = true; return; }
     S.pendingRender = false;
-    document.querySelectorAll(".nav [data-tab]").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === S.tab)));
-    const view = document.getElementById("view");
+    root.querySelectorAll(".nav [data-tab]").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === S.tab)));
+    const view = root.getElementById("view");
     let html;
     if (!S.snap) html = header("BedJet Nights") + `<div class="card"><p class="muted">Connecting...</p></div>`;
     else if (S.tab === "remote") html = remoteView();
@@ -355,7 +356,7 @@
   }
 
   function renderLayer() {
-    const layer = document.getElementById("layer");
+    const layer = root.getElementById("layer");
     const overlay = layer.querySelector(".overlay");
     const sheet = layer.querySelector(".sheet");
     const scroll = { overlay: overlay ? overlay.scrollTop : 0, sheet: sheet ? sheet.scrollTop : 0 };
@@ -373,7 +374,7 @@
     const newSheet = layer.querySelector(".sheet");
     if (newOverlay) newOverlay.scrollTop = scroll.overlay;
     if (newSheet) newSheet.scrollTop = scroll.sheet;
-    document.body.style.overflow = html ? "hidden" : "";
+    root.querySelector(".scroller").style.overflowY = html ? "hidden" : "";
   }
 
   function header(title, eyebrow = "") {
@@ -383,19 +384,17 @@
            <span class="dot ${u && u.status.available ? "on" : u && u.lend_until ? "warn" : ""}"></span><span>${esc(u ? u.name : "BedJet")}</span>
          </button>`
       : "";
+    const menu = host.narrow
+      ? `<button class="menu" data-action="menu" aria-label="Show the Home Assistant sidebar">${icon("menu")}</button>`
+      : "";
     return `<header class="head">
-      <div><p class="eyebrow">${esc(eyebrow)}</p><h1>${esc(title)}</h1></div>
+      <div class="title">${menu}<div><p class="eyebrow">${esc(eyebrow)}</p><h1>${esc(title)}</h1></div></div>
       ${chip}
     </header>${banner()}`;
   }
 
   function banner() {
     if (!S.snap) return "";
-    if (S.offline) return `<div class="card tight" style="margin-bottom:16px"><p class="warning">${icon("alert")}Lost touch with BedJet Nights. Reconnecting...</p></div>`;
-    if (!S.snap.connected) {
-      const why = S.snap.ha_error ? ` ${esc(S.snap.ha_error)}` : "";
-      return `<div class="card tight" style="margin-bottom:16px"><p class="warning">${icon("alert")}<span>Can't reach Home Assistant right now.${why}</span></p></div>`;
-    }
     const u = unit();
     if (u && u.lend_until) {
       return `<div class="card tight" style="margin-bottom:16px">
@@ -414,7 +413,6 @@
     return `<div class="card stack">
       <h2>No BedJet yet</h2>
       <p class="muted">BedJet Nights works through Home Assistant's BedJet integration. Once your BedJet shows up there, it appears here too.</p>
-      <p class="faint small">If your BedJet uses a different integration, list its climate entity in BEDJET_ENTITIES.</p>
     </div>`;
   }
 
@@ -593,7 +591,7 @@
     if (!force && S.historyFor === u.id && Date.now() - S.historyAt < 60000) return;
     S.historyFor = u.id;
     S.historyAt = Date.now();
-    api("GET", unitPath(u, "history") + "?nights=30")
+    ws("history", { unit_id: u.id, nights: 30 })
       .then((data) => { S.history = data.nights; render(); })
       .catch((err) => toast(err.message));
   }
@@ -677,7 +675,7 @@
     S.phaseIndex = null;
     S.sheet = null;
     renderLayer();
-    const input = document.querySelector(".name-input");
+    const input = root.querySelector(".name-input");
     if (isNew && input) input.select();
   }
 
@@ -797,24 +795,24 @@
       if (u.has_led) toggles.push(`<div class="row"><span>LED light</span><button class="toggle" role="switch" aria-checked="${u.status.led === true}" aria-label="LED light" data-action="led" ${u.status.available ? "" : "disabled"}></button></div>`);
       if (u.has_mute) toggles.push(`<div class="row"><span>Mute beeps</span><button class="toggle" role="switch" aria-checked="${u.status.muted === true}" aria-label="Mute beeps" data-action="mute" ${u.status.available ? "" : "disabled"}></button></div>`);
       if (toggles.length) settings += `<div class="card tight stack">${toggles.join("")}</div>`;
+      const admin = !host.hass.user || host.hass.user.is_admin;
       const lend = u.lend_until
         ? `<p class="muted small" style="margin:0">Lent until ${esc(clockFromTs(u.lend_until))}. Home Assistant takes it back by itself.</p>
            <button class="btn secondary" data-action="reclaim" ${S.busy ? "disabled" : ""}>Take it back now</button>`
         : `<div class="programs">${[15, 30, 60, 120].map((m) => `<button class="pill" data-action="lend" data-minutes="${m}" ${S.busy || u.run ? "disabled" : ""}>${m < 60 ? `${m} min` : `${m / 60} hr`}</button>`).join("")}</div>
            ${u.run ? `<p class="faint small" style="margin:0">End tonight's schedule first.</p>` : ""}`;
-      settings += `<div class="card tight stack">
+      if (admin) settings += `<div class="card tight stack">
         <div><b style="font-weight:600">Lend to a phone</b>
-        <p class="muted small" style="margin:4px 0 0">Your BedJet takes one Bluetooth connection at a time. Lending pauses the BedJet integration in Home Assistant so the BedJet app or Lull can connect, for example to update firmware. Home Assistant takes it back when the time is up.</p></div>
+        <p class="muted small" style="margin:4px 0 0">Your BedJet takes one Bluetooth connection at a time. Lending pauses the BedJet integration in Home Assistant so an app on your phone can connect, for example to update firmware in the BedJet app. Home Assistant takes it back when the time is up.</p></div>
         ${lend}
       </div>`;
     }
-    const mqtt = snap.mqtt && snap.mqtt.enabled ? (snap.mqtt.connected ? "Home Assistant entities on (MQTT)" : "MQTT not connected") : "MQTT entities off";
     return `<div class="scrim" data-action="sheet-scrim"><div class="sheet" role="dialog" aria-modal="true" aria-label="BedJets">
       <div class="sheet-head"><h2>Your BedJets</h2><button data-action="sheet-close">Done</button></div>
       <div class="stack" style="gap:12px">
         ${units || `<p class="muted">No BedJet found in Home Assistant.</p>`}
         ${settings}
-        <p class="faint small center" style="margin:6px 0 0">${snap.connected ? `Home Assistant ${esc(snap.ha_version || "")}` : "Home Assistant not connected"} · ${esc(mqtt)}</p>
+        <p class="faint small center" style="margin:6px 0 0">Start night, End night, Tonight's schedule and Start at bedtime are also on each BedJet's device page, for automations.</p>
       </div>
     </div></div>`;
   }
@@ -823,11 +821,15 @@
 
   async function saveDraft() {
     const name = (S.draft.name || "").trim() || "Untitled";
-    const data = await api("POST", "api/schedules", { ...S.draft, name });
+    const data = await ws("schedule/save", { schedule: { ...S.draft, name } });
     return data.schedule;
   }
 
   const handlers = {
+    menu() {
+      // Home Assistant opens its sidebar when this event reaches it.
+      host.dispatchEvent(new Event("hass-toggle-menu", { bubbles: true, composed: true }));
+    },
     device() { S.sheet = "device"; renderLayer(); },
     templates() { S.sheet = "templates"; renderLayer(); },
     "sheet-close"() {
@@ -860,50 +862,50 @@
     },
     "use-tonight"(el) {
       const u = unit();
-      if (u) act("tonight", () => api("POST", unitPath(u, "tonight"), { schedule_id: el.dataset.id }));
+      if (u) act("tonight", () => ws("tonight", { unit_id: u.id, schedule_id: el.dataset.id }));
     },
     start() {
       const u = unit();
-      if (u) act("start", () => api("POST", unitPath(u, "start"), {}));
+      if (u) act("start", () => ws("start", { unit_id: u.id }));
     },
     end() {
       const u = unit();
-      if (u) act("end", () => api("POST", unitPath(u, "end"), {}));
+      if (u) act("end", () => ws("end", { unit_id: u.id }));
     },
     auto() {
       const u = unit();
-      if (u) act("auto", () => api("POST", unitPath(u, "auto"), { enabled: !u.auto.enabled, days: u.auto.days }));
+      if (u) act("auto", () => ws("auto", { unit_id: u.id, enabled: !u.auto.enabled, days: u.auto.days }));
     },
     "auto-day"(el) {
       const u = unit();
       if (!u) return;
       const day = Number(el.dataset.day);
       const days = u.auto.days.includes(day) ? u.auto.days.filter((d) => d !== day) : [...u.auto.days, day];
-      act("auto", () => api("POST", unitPath(u, "auto"), { enabled: true, days }));
+      act("auto", () => ws("auto", { unit_id: u.id, enabled: true, days }));
     },
     "remote-mode"(el) {
       const u = unit();
-      if (u) act("mode", () => api("POST", unitPath(u, "remote"), { mode: el.dataset.mode }));
+      if (u) act("mode", () => ws("remote", { unit_id: u.id, mode: el.dataset.mode }));
     },
     program(el) {
       const u = unit();
-      if (u) act("program", () => api("POST", unitPath(u, "remote"), { program: el.dataset.name }));
+      if (u) act("program", () => ws("remote", { unit_id: u.id, program: el.dataset.name }));
     },
     led() {
       const u = unit();
-      if (u) act("led", () => api("POST", unitPath(u, "remote"), { led: u.status.led !== true }));
+      if (u) act("led", () => ws("remote", { unit_id: u.id, led: u.status.led !== true }));
     },
     mute() {
       const u = unit();
-      if (u) act("mute", () => api("POST", unitPath(u, "remote"), { muted: u.status.muted !== true }));
+      if (u) act("mute", () => ws("remote", { unit_id: u.id, muted: u.status.muted !== true }));
     },
     lend(el) {
       const u = unit();
-      if (u) act("lend", () => api("POST", unitPath(u, "lend"), { minutes: Number(el.dataset.minutes) }));
+      if (u) act("lend", () => ws("lend", { unit_id: u.id, minutes: Number(el.dataset.minutes) }));
     },
     reclaim() {
       const u = unit();
-      if (u) act("reclaim", () => api("POST", unitPath(u, "reclaim"), {}));
+      if (u) act("reclaim", () => ws("reclaim", { unit_id: u.id }));
     },
     night(el) {
       const id = el.dataset.id;
@@ -921,7 +923,7 @@
       const u = unit();
       act("save", async () => {
         const schedule = await saveDraft();
-        if (u) await api("POST", unitPath(u, "tonight"), { schedule_id: schedule.id });
+        if (u) await ws("tonight", { unit_id: u.id, schedule_id: schedule.id });
         S.tab = "schedule";
         closeEditor();
       });
@@ -934,7 +936,7 @@
       const d = S.draft;
       if (!window.confirm(`Delete "${d.name}"?`)) return;
       act("delete", async () => {
-        await api("DELETE", `api/schedules/${encodeURIComponent(d.id)}`);
+        await ws("schedule/delete", { schedule_id: d.id });
         closeEditor();
       });
     },
@@ -968,13 +970,13 @@
     },
   };
 
-  document.addEventListener("click", (event) => {
+  root.addEventListener("click", (event) => {
     const tab = event.target.closest("[data-tab]");
     if (tab) {
       S.tab = tab.dataset.tab;
       saved.set("tab", S.tab);
       if (S.tab === "history") S.historyAt = 0;
-      window.scrollTo(0, 0);
+      root.querySelector(".scroller").scrollTop = 0;
       render();
       return;
     }
@@ -989,7 +991,7 @@
   function updateSliderLook(input, text) {
     const min = Number(input.min), max = Number(input.max), value = Number(input.value);
     input.style.setProperty("--p", `${max > min ? ((value - min) / (max - min)) * 100 : 100}%`);
-    const out = document.getElementById(`${input.id}-out`);
+    const out = root.getElementById(`${input.id}-out`);
     if (out && text !== undefined) out.textContent = text;
   }
 
@@ -997,14 +999,14 @@
     const u = unit();
     if (!u) return;
     S.remotePending[field] = { value, until: Date.now() + 8000 };
-    api("POST", unitPath(u, "remote"), body).catch((err) => {
+    ws("remote", { unit_id: u.id, ...body }).catch((err) => {
       delete S.remotePending[field];
       toast(err.message);
       render();
     });
   }
 
-  document.addEventListener("input", (event) => {
+  root.addEventListener("input", (event) => {
     const input = event.target;
     const kind = input.dataset && input.dataset.input;
     if (!kind) return;
@@ -1035,7 +1037,7 @@
     }
   });
 
-  document.addEventListener("change", (event) => {
+  root.addEventListener("change", (event) => {
     const input = event.target;
     const kind = input.dataset && input.dataset.input;
     if (!kind) return;
@@ -1066,7 +1068,7 @@
   });
 
   // Live updates must not yank a slider out from under a finger.
-  document.addEventListener("pointerdown", (event) => {
+  root.addEventListener("pointerdown", (event) => {
     if (event.target.matches && event.target.matches('input[type="range"]')) S.dragging = true;
   });
   const release = () => {
@@ -1076,22 +1078,102 @@
       if (S.pendingRender) render();
     }, 50);
   };
-  document.addEventListener("pointerup", release);
-  document.addEventListener("pointercancel", release);
+  root.addEventListener("pointerup", release);
+  root.addEventListener("pointercancel", release);
 
-  document.addEventListener("keydown", (event) => {
+  root.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
     if (S.sheet) handlers["sheet-close"]();
     else if (S.draft) closeEditor();
   });
 
   // Keep the running card's minutes and the history fresh.
-  setInterval(() => {
-    if (S.tab === "history") loadHistory();
-    else if (!S.draft) render();
-  }, 30000);
+  let timer = null;
 
-  render();
-  api("GET", "api/state").catch((err) => toast(err.message));
-  connect();
-})();
+  return {
+    start() {
+      connect();
+      if (!timer) {
+        timer = setInterval(() => {
+          if (S.tab === "history") loadHistory();
+          else if (!S.draft) render();
+        }, 30000);
+      }
+      render();
+    },
+    stop() {
+      disconnect();
+      clearInterval(timer);
+      timer = null;
+    },
+    render,
+  };
+}
+
+class BedJetNightsPanel extends HTMLElement {
+  constructor() {
+    super();
+    this._hass = null;
+    this._narrow = false;
+    this._app = null;
+    const shadow = this.attachShadow({ mode: "open" });
+    shadow.innerHTML = `<link rel="stylesheet" href="${STYLESHEET}">
+      <div class="frame">
+        <div class="scroller"><main class="app" id="view" aria-live="polite"></main></div>
+        <nav class="nav" role="tablist" aria-label="Sections">
+          <button role="tab" data-tab="schedule" aria-selected="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z"/><path d="M17 3v4M15 5h4"/></svg>
+            Schedule
+          </button>
+          <button role="tab" data-tab="remote" aria-selected="false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="13" r="7"/><path d="M12 13V9.5M9 3h6"/></svg>
+            Remote
+          </button>
+          <button role="tab" data-tab="history" aria-selected="false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></svg>
+            History
+          </button>
+        </nav>
+        <div id="layer"></div>
+      </div>`;
+  }
+
+  get hass() {
+    return this._hass;
+  }
+
+  set hass(hass) {
+    const first = !this._hass;
+    this._hass = hass;
+    if (first && this.isConnected) this._start();
+  }
+
+  get narrow() {
+    return this._narrow;
+  }
+
+  set narrow(narrow) {
+    const changed = narrow !== this._narrow;
+    this._narrow = narrow;
+    if (changed && this._app) this._app.render();
+  }
+
+  set panel(_panel) {}
+
+  set route(_route) {}
+
+  connectedCallback() {
+    if (this._hass) this._start();
+  }
+
+  disconnectedCallback() {
+    if (this._app) this._app.stop();
+  }
+
+  _start() {
+    if (!this._app) this._app = createApp(this.shadowRoot, this);
+    this._app.start();
+  }
+}
+
+if (!customElements.get("bedjet-nights-panel")) customElements.define("bedjet-nights-panel", BedJetNightsPanel);
