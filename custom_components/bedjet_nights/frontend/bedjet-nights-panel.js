@@ -803,7 +803,7 @@ function createApp(root, host) {
            ${u.run ? `<p class="faint small" style="margin:0">End tonight's schedule first.</p>` : ""}`;
       if (admin) settings += `<div class="card tight stack">
         <div><b style="font-weight:600">Lend to a phone</b>
-        <p class="muted small" style="margin:4px 0 0">Your BedJet takes one Bluetooth connection at a time. Lending pauses the BedJet integration in Home Assistant so the BedJet app or Lull can connect, for example to update firmware. Home Assistant takes it back when the time is up.</p></div>
+        <p class="muted small" style="margin:4px 0 0">Your BedJet takes one Bluetooth connection at a time. Lending pauses the BedJet integration in Home Assistant so an app on your phone can connect, for example to update firmware in the BedJet app. Home Assistant takes it back when the time is up.</p></div>
         ${lend}
       </div>`;
     }

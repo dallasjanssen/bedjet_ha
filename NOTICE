@@ -1,5 +1,8 @@
 BedJet Nights brings ideas and logic from Lull into Home Assistant.
 
+A copy of this notice ships inside custom_components/bedjet_nights, so it travels
+with the integration when HACS or a manual install copies only that folder.
+
 Lull (https://github.com/rkanjani/lull) schedules a BedJet from an iPhone or an
 Android phone. BedJet Nights follows its phase model, the BedJet's per-mode
 limits and heat safety table, the four starter schedules, the night curve, and

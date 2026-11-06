@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "BedJet Nights",
-        "description": "Adds Lull-style schedules, a remote and night history for the BedJets already in Home Assistant. A BedJet Nights panel appears in the sidebar."
+        "description": "Adds night schedules, a remote and night history for the BedJets already in Home Assistant. A BedJet Nights panel appears in the sidebar."
       }
     },
     "abort": {

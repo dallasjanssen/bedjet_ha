@@ -5,7 +5,7 @@ from __future__ import annotations
 from homeassistant.const import Platform
 
 DOMAIN = "bedjet_nights"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 PANEL_URL_PATH = "bedjet-nights"
 PANEL_ELEMENT = "bedjet-nights-panel"

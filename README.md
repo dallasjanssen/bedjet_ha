@@ -1,6 +1,6 @@
 # BedJet Nights
 
-Lull-style schedules, a remote and night history for your BedJet, built into Home Assistant.
+Night schedules, a remote and night history for your BedJet, built into Home Assistant.
 
 ![BedJet Nights on a phone](docs/screens.png)
 
