@@ -1,0 +1,15 @@
+services:
+  bedjet-nights:
+    build: .
+    image: bedjet-nights:latest
+    container_name: bedjet-nights
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8099:8099"
+    volumes:
+      - ./data:/data
+    extra_hosts:
+      # Lets HA_URL=http://host.docker.internal:8123 reach a Home Assistant
+      # container that runs with host networking on the same machine.
+      - "host.docker.internal:host-gateway"
