@@ -1,10 +1,9 @@
-"""The heart of the app: plays schedules through the night and keeps each BedJet's history.
+"""The heart of BedJet Nights: plays schedules through the night and keeps each BedJet's history.
 
 Lull saves a schedule into the BedJet and lets the BedJet run it, because a phone can walk away.
-The Home Assistant machine never walks away, so here Home Assistant plays the schedule phase by
-phase. Each phase also sets the BedJet's own shut-off timer to the end of the phase (plus a
-couple of minutes), so if this app or Home Assistant stopped mid-night, the BedJet would still
-turn itself off on time instead of running on.
+Home Assistant never walks away, so here Home Assistant plays the schedule phase by phase. Each
+phase also sets the BedJet's own shut-off timer to the end of the phase (plus a couple of
+minutes), so if Home Assistant stopped mid-night the BedJet would still turn itself off on time.
 """
 
 from __future__ import annotations
@@ -14,16 +13,23 @@ import contextlib
 import logging
 import math
 import time
-from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo
+
+from homeassistant.config_entries import ConfigEntry, ConfigEntryDisabler
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, State, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import async_call_later, async_track_state_change_event, async_track_time_interval
+from homeassistant.util import dt as dt_util
 
 from .bedjet import Air, BedJetUnit, find_bedjets
-from .config import Config
-from .ha import HomeAssistant, HomeAssistantError
+from .const import HISTORY_DAYS, SIGNAL_UNITS, SIGNAL_UPDATE
 from .model import ActiveRun, Mode, Schedule, describe_run, night_phases, problem, templates
-from .store import Store
+from .storage import NightsStore
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,11 +38,11 @@ RUNTIME_MARGIN = 2
 RECORD_SETTLE = 4.0
 """Seconds a change has to hold before history records it; a mode change arrives in several updates."""
 AUTO_START_WINDOW = 5
-"""Minutes after bedtime a bedtime start still happens, in case the app was restarting right then."""
+"""Minutes after bedtime a bedtime start still happens, in case Home Assistant was restarting then."""
 RETRY_SECONDS = 15
 
 
-class ActionError(Exception):
+class ActionError(HomeAssistantError):
     """Something the person asked for can't be done, with a reason worth showing them."""
 
 
@@ -50,71 +56,105 @@ def _air_key(air: Air | None) -> tuple[Any, ...] | None:
 
 
 class Nights:
-    def __init__(self, config: Config, store: Store, ha: HomeAssistant) -> None:
-        self.config = config
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, store: NightsStore) -> None:
+        self.hass = hass
+        self.entry = entry
         self.store = store
-        self.ha = ha
         self.units: dict[str, BedJetUnit] = {}
         self.runs: dict[str, ActiveRun] = {}
         self.applied: dict[str, int] = {}
-        for unit_id, saved in (store.get("runs") or {}).items():
-            with contextlib.suppress(KeyError, ValueError, TypeError):
-                self.runs[unit_id] = ActiveRun.from_dict(saved)
-                self.applied[unit_id] = int(saved.get("applied", -1))
-        self.listeners: list[Callable[[], None]] = []
         self.errors: dict[str, str] = {}
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
-        self._record_timers: dict[str, asyncio.TimerHandle] = {}
+        self._record_timers: dict[str, CALLBACK_TYPE] = {}
         self._last_air: dict[str, Air | None] = {}
+        self._seeded: set[str] = set()
         self._runtime_seen: dict[str, int] = {}
         self._quiet_until: dict[str, float] = {}
         self._pruned_at = 0.0
-        ha.ready_listeners.append(self._on_ready)
-        ha.state_listeners.append(self._on_state)
-        ha.disconnect_listeners.append(self._changed)
+        self._unsubs: list[CALLBACK_TYPE] = []
+        self._unsub_states: CALLBACK_TYPE | None = None
+        self._unsub_refresh: CALLBACK_TYPE | None = None
 
     # Lifecycle
 
-    def start(self) -> None:
-        self._task = asyncio.create_task(self._loop())
+    async def async_start(self) -> None:
+        for unit_id, saved in (self.store.get("runs") or {}).items():
+            with contextlib.suppress(KeyError, ValueError, TypeError):
+                self.runs[unit_id] = ActiveRun.from_dict(saved)
+                self.applied[unit_id] = int(saved.get("applied", -1))
+        self._refresh_units()
+        self._unsubs.append(self.hass.bus.async_listen(er.EVENT_ENTITY_REGISTRY_UPDATED, self._registry_changed))
+        self._unsubs.append(self.hass.bus.async_listen(dr.EVENT_DEVICE_REGISTRY_UPDATED, self._registry_changed))
+        self._unsubs.append(self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, self._started))
+        # The minutes left in a phase change without any state change, so refresh once a minute.
+        self._unsubs.append(async_track_time_interval(self.hass, self._minute, timedelta(minutes=1)))
+        self._task = self.hass.async_create_background_task(self._loop(), "bedjet_nights scheduler")
 
-    async def stop(self) -> None:
+    async def async_stop(self) -> None:
+        for unsub in self._unsubs:
+            unsub()
+        self._unsubs.clear()
+        if self._unsub_states:
+            self._unsub_states()
+        if self._unsub_refresh:
+            self._unsub_refresh()
+        for cancel in self._record_timers.values():
+            cancel()
         if self._task:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
-        for handle in self._record_timers.values():
-            handle.cancel()
+        await self.store.async_flush()
 
+    @callback
     def _changed(self) -> None:
-        for listener in self.listeners:
-            listener()
+        async_dispatcher_send(self.hass, SIGNAL_UPDATE)
 
-    async def _on_ready(self) -> None:
-        found = find_bedjets(self.ha, self.config.bedjet_entities)
+    @callback
+    def _minute(self, _now: datetime) -> None:
+        if self.runs:
+            self._changed()
+
+    @callback
+    def _started(self, _event: Event) -> None:
+        self._refresh_units()
+
+    @callback
+    def _registry_changed(self, _event: Event) -> None:
+        if self._unsub_refresh:
+            self._unsub_refresh()
+
+        @callback
+        def refresh(_now: datetime) -> None:
+            self._unsub_refresh = None
+            self._refresh_units()
+
+        self._unsub_refresh = async_call_later(self.hass, 1, refresh)
+
+    @callback
+    def _refresh_units(self) -> None:
         units: dict[str, BedJetUnit] = {}
-        for entry in found:
-            unit = self.units.get(entry["entity_id"]) or BedJetUnit(self.ha, entry)
+        for entry in find_bedjets(self.hass):
+            unit = next((u for u in self.units.values() if u.registry_id == entry.id), None) or BedJetUnit(self.hass, entry)
             unit.refresh_links()
             units[unit.id] = unit
         added = set(units) - set(self.units)
         self.units = units
         if added:
             _LOGGER.info("BedJets: %s", ", ".join(f"{u.name} ({u.id})" for u in units.values()))
+        watched = [e for u in units.values() for e in (u.id, u.runtime_entity, u.ambient_entity, u.led_entity, u.mute_entity) if e]
+        if self._unsub_states:
+            self._unsub_states()
+        self._unsub_states = async_track_state_change_event(self.hass, watched, self._on_state) if watched else None
         for unit in units.values():
-            if unit.id not in self._last_air:
-                # A BedJet seen for the first time starts its history at its first change, not with how it was found.
-                self._last_air[unit.id] = self._air_from_history(unit.id) or unit.air()
-            # Anything changed while this app was away is noticed now.
+            # Anything changed while Home Assistant was away is noticed now.
             self._record_air(unit)
-        if not units:
-            _LOGGER.warning(
-                "No BedJet found in Home Assistant. Set up the BedJet integration, "
-                "or name the climate entity in BEDJET_ENTITIES."
-            )
         self._wake.set()
+        async_dispatcher_send(self.hass, SIGNAL_UNITS)
         self._changed()
+
+    # Watching the BedJets
 
     def _air_from_history(self, unit_id: str) -> Air | None:
         last = self.store.last_entry(unit_id)
@@ -127,8 +167,6 @@ class Nights:
             return Air(Mode.STANDBY, None, None)
         return None
 
-    # Watching Home Assistant
-
     def _unit_owning(self, entity_id: str) -> tuple[BedJetUnit, str] | None:
         for unit in self.units.values():
             if entity_id == unit.id:
@@ -139,8 +177,9 @@ class Nights:
                 return unit, "other"
         return None
 
-    def _on_state(self, entity_id: str, old: dict[str, Any] | None, new: dict[str, Any] | None) -> None:
-        owner = self._unit_owning(entity_id)
+    @callback
+    def _on_state(self, event: Event) -> None:
+        owner = self._unit_owning(event.data["entity_id"])
         if owner is None:
             return
         unit, role = owner
@@ -150,23 +189,31 @@ class Nights:
             if air and air.mode != Mode.STANDBY and minutes is not None:
                 self._runtime_seen[unit.id] = minutes
         elif role == "climate":
-            self._watch_for_turn_off(unit, old, new)
-            handle = self._record_timers.pop(unit.id, None)
-            if handle:
-                handle.cancel()
-            loop = asyncio.get_running_loop()
-            self._record_timers[unit.id] = loop.call_later(RECORD_SETTLE, self._record_air, unit)
+            self._watch_for_turn_off(unit, event.data.get("old_state"), event.data.get("new_state"))
+            self._record_later(unit)
         self._changed()
 
-    def _watch_for_turn_off(self, unit: BedJetUnit, old: dict[str, Any] | None, new: dict[str, Any] | None) -> None:
-        """A BedJet turned off mid-phase, on its own remote or in Home Assistant, ends the night.
+    def _record_later(self, unit: BedJetUnit) -> None:
+        cancel = self._record_timers.pop(unit.id, None)
+        if cancel:
+            cancel()
+
+        @callback
+        def record(_now: datetime) -> None:
+            self._record_timers.pop(unit.id, None)
+            self._record_air(unit)
+
+        self._record_timers[unit.id] = async_call_later(self.hass, RECORD_SETTLE, record)
+
+    def _watch_for_turn_off(self, unit: BedJetUnit, old: State | None, new: State | None) -> None:
+        """A BedJet turned off mid-phase, on its own remote or elsewhere in Home Assistant, ends the night.
 
         Its own timer running out does not: the schedule carries on with the next phase.
         """
         run = self.runs.get(unit.id)
-        if run is None or not old or not new:
+        if run is None or old is None or new is None:
             return
-        if old.get("state") in ("off", "unavailable", "unknown") or new.get("state") != "off":
+        if old.state in ("off", "unavailable", "unknown") or new.state != "off":
             return
         now = time.time()
         index = run.index_at(now)
@@ -178,17 +225,26 @@ class Nights:
             _LOGGER.info("%s timer ran out mid-phase; the schedule resumes at the next phase", unit.id)
             return
         _LOGGER.info("%s was turned off elsewhere; ending %s", unit.id, run.schedule.name)
-        asyncio.get_running_loop().create_task(self.end_night(unit.id, ending="turned_off", turn_off=False))
+        self.hass.async_create_task(self.end_night(unit.id, ending="turned_off", turn_off=False))
 
+    @callback
     def _record_air(self, unit: BedJetUnit) -> None:
-        self._record_timers.pop(unit.id, None)
         if unit.lock.locked():
             # A change is still being made; record where it lands, not the steps on the way.
-            loop = asyncio.get_running_loop()
-            self._record_timers[unit.id] = loop.call_later(RECORD_SETTLE, self._record_air, unit)
+            self._record_later(unit)
             return
         air = unit.air()
-        if air is None or _air_key(air) == _air_key(self._last_air.get(unit.id)):
+        if air is None:
+            return
+        if unit.id not in self._seeded:
+            self._seeded.add(unit.id)
+            last = self._air_from_history(unit.id)
+            if last is None:
+                # A BedJet seen for the first time starts its history at its first change.
+                self._last_air[unit.id] = air
+                return
+            self._last_air[unit.id] = last
+        if _air_key(air) == _air_key(self._last_air.get(unit.id)):
             return
         self._last_air[unit.id] = air
         now = time.time()
@@ -225,7 +281,9 @@ class Nights:
     async def _loop(self) -> None:
         while True:
             try:
-                await self._tick()
+                await self.async_tick()
+            except asyncio.CancelledError:
+                raise
             except Exception:  # noqa: BLE001 - the loop must keep the night going
                 _LOGGER.exception("Scheduler tick failed")
             self._wake.clear()
@@ -244,7 +302,7 @@ class Nights:
             wait = min(wait, run.phase_ends()[index] - now + 0.5)
         return max(wait, 0.5)
 
-    async def _tick(self) -> None:
+    async def async_tick(self) -> None:
         now = time.time()
         for unit_id in list(self.runs):
             await self._play(unit_id, now)
@@ -252,7 +310,7 @@ class Nights:
         await self._return_lent()
         if now - self._pruned_at > 86400:
             self._pruned_at = now
-            self.store.prune(now - self.config.history_days * 86400)
+            self.store.prune(now - HISTORY_DAYS * 86400)
 
     async def _play(self, unit_id: str, now: float) -> None:
         run = self.runs.get(unit_id)
@@ -294,14 +352,8 @@ class Nights:
 
     # Bedtime starts
 
-    def tz(self) -> ZoneInfo:
-        try:
-            return ZoneInfo(self.ha.time_zone)
-        except Exception:  # noqa: BLE001 - an unknown zone falls back to UTC
-            return ZoneInfo("UTC")
-
     async def _bedtime_starts(self) -> None:
-        local = datetime.now(self.tz())
+        local = dt_util.now()
         minute = local.hour * 60 + local.minute
         for unit_id, unit in self.units.items():
             settings = self.unit_settings(unit_id)
@@ -335,11 +387,12 @@ class Nights:
         if not unit.config_entry_id:
             raise ActionError("Couldn't find this BedJet's integration in Home Assistant.")
         minutes = min(max(int(minutes), 5), 240)
-        try:
-            await self.ha.set_config_entry_disabled(unit.config_entry_id, True)
-        except HomeAssistantError as err:
-            raise ActionError(f"Home Assistant wouldn't let go of the BedJet: {err}") from err
         self.update_unit_settings(unit_id, lend_until=time.time() + minutes * 60, lend_entry=unit.config_entry_id)
+        try:
+            await self.hass.config_entries.async_set_disabled_by(unit.config_entry_id, ConfigEntryDisabler.USER)
+        except Exception as err:  # noqa: BLE001 - any failure is shown to the person
+            self.update_unit_settings(unit_id, lend_until=None, lend_entry=None)
+            raise ActionError(f"Home Assistant wouldn't let go of the BedJet: {err}") from err
         self._wake.set()
 
     async def reclaim(self, unit_id: str) -> None:
@@ -347,17 +400,16 @@ class Nights:
         entry = settings.get("lend_entry") or (self.units[unit_id].config_entry_id if unit_id in self.units else None)
         if not entry:
             return
-        try:
-            await self.ha.set_config_entry_disabled(entry, False)
-        except HomeAssistantError as err:
-            raise ActionError(f"Home Assistant couldn't take the BedJet back: {err}") from err
+        if self.hass.config_entries.async_get_entry(entry) is not None:
+            try:
+                await self.hass.config_entries.async_set_disabled_by(entry, None)
+            except Exception as err:  # noqa: BLE001 - any failure is shown to the person
+                raise ActionError(f"Home Assistant couldn't take the BedJet back: {err}") from err
         self.update_unit_settings(unit_id, lend_until=None, lend_entry=None)
 
     async def _return_lent(self) -> None:
-        if not self.ha.connected:
-            return
         now = time.time()
-        for unit_id in self.store.get("unit_index") or {}:
+        for unit_id in list((self.store.get("unit_settings") or {}).keys()):
             until = self.unit_settings(unit_id).get("lend_until")
             if until and until <= now:
                 with contextlib.suppress(ActionError):
@@ -366,16 +418,14 @@ class Nights:
     # Settings
 
     def unit_settings(self, unit_id: str) -> dict[str, Any]:
-        return self.store.get(f"unit:{unit_id}") or {}
+        return dict((self.store.get("unit_settings") or {}).get(unit_id) or {})
 
     def update_unit_settings(self, unit_id: str, **changes: Any) -> dict[str, Any]:
         settings = {**self.unit_settings(unit_id), **changes}
         settings = {key: value for key, value in settings.items() if value is not None}
-        self.store.put(f"unit:{unit_id}", settings)
-        index = self.store.get("unit_index") or {}
-        if unit_id not in index:
-            index[unit_id] = True
-            self.store.put("unit_index", index)
+        everything = dict(self.store.get("unit_settings") or {})
+        everything[unit_id] = settings
+        self.store.put("unit_settings", everything)
         self._changed()
         return settings
 
@@ -478,9 +528,9 @@ class Nights:
                 await unit.set_switch("muted", bool(body["muted"]))
             else:
                 raise ActionError("Nothing to change.")
-        except HomeAssistantError as err:
-            raise ActionError(str(err)) from err
-        except ValueError as err:
+        except ActionError:
+            raise
+        except (HomeAssistantError, ValueError) as err:
             raise ActionError(str(err)) from err
 
     def save_schedule(self, data: dict[str, Any]) -> Schedule:
@@ -493,7 +543,7 @@ class Nights:
         return schedule
 
     def delete_schedule(self, schedule_id: str) -> None:
-        for unit_id, run in self.runs.items():
+        for run in self.runs.values():
             if run.schedule.id == schedule_id:
                 raise ActionError("That schedule is running. End the night first.")
         self.store.delete_schedule(schedule_id)
@@ -506,8 +556,10 @@ class Nights:
 
     def set_auto(self, unit_id: str, enabled: bool, days: list[int] | None = None) -> None:
         current = self.unit_settings(unit_id).get("auto") or {}
-        chosen = sorted({int(day) for day in (days if days is not None else current.get("days", range(7))) if 0 <= int(day) <= 6})
-        self.update_unit_settings(unit_id, auto={"enabled": bool(enabled), "days": chosen})
+        chosen = days if days is not None else current.get("days", list(range(7)))
+        self.update_unit_settings(
+            unit_id, auto={"enabled": bool(enabled), "days": sorted({int(d) for d in chosen if 0 <= int(d) <= 6})}
+        )
 
     # Reading
 
@@ -535,11 +587,8 @@ class Nights:
 
     def snapshot(self) -> dict[str, Any]:
         return {
-            "connected": self.ha.connected,
-            "ha_error": self.ha.last_error,
-            "ha_version": self.ha.version,
-            "fahrenheit": self.ha.fahrenheit,
-            "time_zone": self.ha.time_zone,
+            "fahrenheit": self.hass.config.units.temperature_unit == "°F",
+            "time_zone": self.hass.config.time_zone,
             "now": time.time(),
             "units": [self.unit_snapshot(unit) for unit in self.units.values()],
             "schedules": [schedule.to_dict() for schedule in self.store.schedules()],
@@ -548,14 +597,13 @@ class Nights:
 
     def history(self, unit_id: str, nights: int = 14) -> list[dict[str, Any]]:
         """Everything recorded between one noon and the next, so 3 a.m. belongs with the evening before."""
-        tz = self.tz()
+        tz = dt_util.get_default_time_zone()
         entries = self.store.history(unit_id, time.time() - (nights + 1) * 86400)
         grouped: dict[str, list[dict[str, Any]]] = {}
         for entry in entries:
             evening = (datetime.fromtimestamp(entry["ts"], tz) - timedelta(hours=12)).date().isoformat()
             grouped.setdefault(evening, []).append(entry)
-        result = []
-        for evening in sorted(grouped, reverse=True)[:nights]:
-            items = grouped[evening]
-            result.append({"id": evening, "entries": items, "phases": night_phases(items)})
-        return result
+        return [
+            {"id": evening, "entries": grouped[evening], "phases": night_phases(grouped[evening])}
+            for evening in sorted(grouped, reverse=True)[:nights]
+        ]

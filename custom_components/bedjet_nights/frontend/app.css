@@ -1,4 +1,4 @@
-:root {
+:host {
   color-scheme: dark;
   --bg: #000;
   --surface: #0e0f12;
@@ -25,17 +25,29 @@
 
 * { box-sizing: border-box; }
 
-html, body {
-  margin: 0;
+/* The panel fills Home Assistant's content area; everything floating is placed inside it. */
+:host {
+  display: block;
+  position: relative;
+  /* Home Assistant's panel container has no height of its own, so take the screen's. */
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
   background: var(--bg);
   color: var(--text);
-  min-height: 100%;
-}
-
-body {
-  overscroll-behavior-y: none;
   -webkit-tap-highlight-color: transparent;
 }
+
+.frame { position: absolute; inset: 0; }
+
+.scroller {
+  position: absolute;
+  inset: 0;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
 
 button, input { font: inherit; color: inherit; }
 
@@ -67,6 +79,23 @@ button:disabled { cursor: default; opacity: 0.4; }
   gap: 12px;
   margin: 8px 0 20px;
 }
+
+.head .title { display: flex; align-items: flex-start; gap: 12px; min-width: 0; }
+
+.menu {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  margin-top: 2px;
+  border-radius: 50%;
+  background: var(--raised);
+  border: 1px solid var(--hairline);
+  flex: none;
+}
+
+.menu svg { width: 20px; height: 20px; }
 
 .head h1 {
   font-size: 34px;
@@ -526,7 +555,7 @@ input[type="range"]::-moz-range-thumb {
 /* Overlays */
 
 .overlay {
-  position: fixed;
+  position: absolute;
   inset: 0;
   z-index: 20;
   background: var(--bg);
@@ -577,7 +606,7 @@ input[type="range"]::-moz-range-thumb {
 }
 
 .scrim {
-  position: fixed;
+  position: absolute;
   inset: 0;
   z-index: 30;
   background: rgba(0, 0, 0, 0.55);
@@ -590,7 +619,7 @@ input[type="range"]::-moz-range-thumb {
 .sheet {
   width: 100%;
   max-width: 560px;
-  max-height: 92vh;
+  max-height: 92%;
   overflow-y: auto;
   background: var(--surface);
   border: 1px solid var(--hairline);
@@ -627,7 +656,7 @@ input[type="range"]::-moz-range-thumb {
 /* Bottom navigation */
 
 .nav {
-  position: fixed;
+  position: absolute;
   left: 50%;
   bottom: calc(16px + env(safe-area-inset-bottom));
   transform: translateX(-50%);
@@ -662,7 +691,7 @@ input[type="range"]::-moz-range-thumb {
 /* Toast */
 
 .toast {
-  position: fixed;
+  position: absolute;
   left: 50%;
   bottom: calc(96px + env(safe-area-inset-bottom));
   transform: translateX(-50%);

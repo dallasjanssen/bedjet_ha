@@ -1,4 +1,4 @@
-from bedjet_nights.model import (
+from custom_components.bedjet_nights.model import (
     MAX_STEP_MINUTES,
     ActiveRun,
     Mode,
